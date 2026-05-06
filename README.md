@@ -1,26 +1,30 @@
 # No DOM, No Cry: Human-Inspired CAPTCHA Solving via YOLO Reflexes and VLM Teachers
 
+  Vision-language model (VLM) agents can now operate computers on behalf of users, and recent work shows they can solve visual CAPTCHAs without task-specific training. What they lack is the ability to learn from the experience. Humans, by contrast, leverage prior experience naturally. The first CAPTCHA requires deliberate effort to read the instructions, examine the grid, and reason about each tile, but after a few encounters the entire process collapses into reflex. VLM agents never make this transition. Every CAPTCHA is treated as a novel reasoning problem, even after hundreds of encounters with visually identical challenges at significant latency and cost (e.g., 21.8s and \$2.40 per 100 puzzles). Fast specialized classifiers avoid this cost but fail entirely on unseen categories, and neither approach improves over time with exposure.
 
-  Traditional CAPTCHA solvers require Document Object Model (DOM) access to detect UI elements, making them incompatible with fully visual GUI agents. While Vision-Language Models (VLMs) offer superior reasoning, they are too expensive and slow for real-time CAPTCHA solutions. We introduce a DOM-free hybrid architecture inspired by how humans develop reflexes for familiar patterns to avoid the latency of decision process. In this architecture, YOLO model handles frequent and routine tasks like human reflexes while VLM reasoning intervenes only for novel or hard problems like a slow cognitive process. Our system utilizes a fine-tuned YOLOv8 backbone for real-time UI localization, dynamically routing challenges either to specialized YOLO classifiers for rapid pattern recognition or to an open-weight Qwen-7B VLM for semantic reasoning on novel or hard-to-distinguish categories. Combining these complementary strengths, our hybrid method achieves 86.85% macro-averaged recall, +24.2% over YOLO-only baselines. This macro-averaged performance is critical as CAPTCHA designers can prioritize the distributions of classes where known YOLO-only solvers fail. Beyond current performance gains, this work establishes a paradigm shift in efficient automation where VLM acts as a "teacher" to programmatically label novel challenges encountered during operation. We propose that as the agent accumulates sufficient samples for new categories, it can autonomously train and deploy specialized YOLO-based solvers as reflexes. Until such data is sufficient, VLM continues to intervene to provide accurate solutions. This approach allows future AI agents to achieve maximum efficiency by distilling expensive visual reasoning into millisecond-scale reflexes, using VLM for the discovery of novel patterns while specialized classifiers execute rapid responses required for CAPTCHA solution.
-
+This paper is not about building yet another CAPTCHA solver --- it is about what CAPTCHA solving looks like in the agentic era, where solvers can reason, learn, and adapt. We present a DOM-free hybrid architecture that mirrors human dual-process cognition: a fine-tuned YOLOv8 provides fast reflexes from screenshots while an open-weight Qwen-7B VLM supplies deliberate reasoning, with a confidence-based cascade dispatching 70\% of challenges at reflex speed (4ms) and invoking VLM (225ms) only when needed. The hybrid achieves 85.4\% overall and 84.2\% macro accuracy across 16 classes (+10.0pp and +24.2pp over a YOLO-only baseline). By design, every challenge the VLM solves becomes a labeled training example for YOLO, enabling the system to autonomously expand its capabilities with each encounter. We demonstrate that previously unsupported object classes can be learned from only a few VLM-labeled puzzle encounters, and that PGD adversarial attacks reducing YOLO to 0\% accuracy are autonomously recovered through VLM-guided retraining. Counterintuitively, under iterative grey-box escalation, VLM's imperfect labels cause the solver to diverge from the defender's surrogate, yielding a 53pp robustness advantage that clean labels cannot achieve --- a property typically seen as a limitation becomes an implicit defense. These results challenge a core assumption of visual CAPTCHA defenses: that bot failures remain persistent. When a solver reasons, adapts, and hardens with each encounter, temporary failures become permanent reflexes, undermining the security model that visual CAPTCHAs depend on.
 
 ## Key Strengths
 
 **State-of-the-Art Performance**
+
 - Handles all three reCAPTCHA v2 puzzle types with rare class support (classification, segmentation, dynamic)
 - 86.85% macro-averaged recall (+24.2% over YOLO-only baselines)
 
 **Cross-Platform Compatible**
+
 - Works on Linux, macOS and Windows
 - No platform-specific dependencies or modifications required
 
 **Cross-Browser Compatible**
+
 - **Works with ANY browser** (Chrome, Firefox, Edge, Safari, etc.)
 - **No DOM access required** - Screenshot-based interaction
 - **No browser automation frameworks** No automation framework or browser needed (Selenium, Playwright, Puppeteer)
 - **Evades WebDriver detection** - No DOM manipulation signatures
 
 **Open-Weight Models**
+
 - Uses Qwen-7B-VL (open-weight) instead of proprietary APIs
 - No API costs for inference
 - Fully reproducible on-premise
@@ -28,32 +32,38 @@
 ## System Requirements
 
 ### Hardware Requirements
+
 - **Recommended (Hybrid mode)**: 32GB RAM, 16GB+ GPU VRAM (NVIDIA RTX 3090 or equivalent), 100GB disk space
 
 ### Software Requirements
+
 - **Operating Systems**: Linux, macOS or Windows (tested on all three)
 - **Python**: 3.11
 - **Browsers**: Any modern browser with screenshot capability
 - **Key Libraries**: PyTorch, Transformers, Ultralytics (YOLOv8), PyAutoGUI, MSS, OpenCV
 - **Display Resolution**: The system performs optimally at 1920x1080 resolution. For other display resolutions, browser zoom adjustment may be necessary to ensure reliable UI element localization
+
 ### Platform-Specific Requirements
 
 **Linux**:
+
 ```bash
 sudo apt install gnome-screenshot
 ```
 
 **macOS**:
+
 - No additional requirements (uses built-in `screencapture`)
 
 **Windows**:
+
 - No additional requirements (uses Windows API)
 
 ## Installation
 
 1. Ensure Python 3.11 is installed on your system
-
 2. Create a virtual environment:
+
 ```bash
 # Linux/Mac
 python3.11 -m venv venv
@@ -65,6 +75,7 @@ venv\Scripts\activate
 ```
 
 3. Install dependencies:
+
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
@@ -105,10 +116,12 @@ python main.py --backend hybrid
 ## Architecture Overview
 
 Our system implements a human-inspired dual-process approach:
+
 - **YOLO (Fast Reflexes)**: Handles frequent, routine patterns with millisecond inference
 - **VLM (Slow Reasoning)**: Intervenes for novel or semantically complex challenges
 
 This hybrid architecture achieves superior performance by combining:
+
 1. Fine-tuned YOLOv8 for real-time UI element detection
 2. Specialized YOLO classifiers for common object classes
 3. Open-weight Qwen-7B-VL for zero-shot reasoning on rare categories
@@ -143,7 +156,6 @@ This hybrid architecture achieves superior performance by combining:
 3. **Puzzle Analysis**: OCR extracts target object; determines puzzle type (classification vs segmentation)
 4. **Solving**: Routes to YOLO (fast) or VLM (accurate on rare classes) based on target object
 5. **Verification**: Checks success and handles dynamic puzzles (tiles refresh after clicks)
-
 
 ## Ethical Considerations
 
