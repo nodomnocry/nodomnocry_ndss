@@ -21,6 +21,9 @@ import json
 from datetime import datetime
 from logger import logger
 from config import config
+# === METRICS START ===
+from metrics import metrics
+# === METRICS END ===
 from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Dict, Any
 from universal_object_analyzer import VisionLLMClient
@@ -150,19 +153,24 @@ class UnifiedCaptchaProcessor:
         processor = UnifiedCaptchaProcessor(backend='llm')
     """
     
-    # Hybrid cascade thresholds (deployment variant of paper Eq. 3).
-    # The paper compares max(softmax) to a single threshold; we instead use
-    # the target-class probability and its rank, which handles cells containing
-    # multiple objects (e.g. a clear motorcycle dominates softmax even when the
-    # target is the crosswalk also visible in the cell).
+    # Hybrid cascade threshold per paper Eq. 3 (tau = 0.70).
     #
     # Per cell:
-    #   target_prob >= HYBRID_TAU_SELECT             -> SELECT (trust YOLO)
-    #   target in top-K AND target_prob >= FLOOR     -> VLM fallback
-    #   otherwise                                    -> REJECT (YOLO doesn't rank target)
+    #   max(softmax) >= HYBRID_TAU_SELECT  -> trust YOLO (select if argmax == target,
+    #                                        else reject)
+    #   max(softmax) <  HYBRID_TAU_SELECT  -> VLM fallback with paper Appendix H
+    #                                        0-15 numbered-class prompt
+    # Targets unsupported by YOLO (e.g. Boat, Taxi, Tractor) route the entire
+    # puzzle to VLM (paper Eq. 3 branch 1).
     HYBRID_TAU_SELECT = 0.70
-    HYBRID_VLM_FLOOR = 0.10
-    HYBRID_TOP_K = 3
+
+    # Paper class set (16 classes, indices match Appendix H prompt).
+    PAPER_CLASS_NAMES = (
+        'Bicycle', 'Bridge', 'Bus', 'Car', 'Chimney',
+        'Crosswalk', 'Hydrant', 'Motorcycle', 'Mountain',
+        'Other', 'Palm', 'Stairs', 'Traffic Light',
+        'Boat', 'Taxi', 'Tractor',
+    )
     
     def __init__(self, backend: str = 'yolo'):
         """
@@ -1274,6 +1282,11 @@ class UnifiedCaptchaProcessor:
         logger.always_log(f"   Cells selected: {len(selected_cells)}")
         logger.always_log(f"   Selected cell indices: {selected_cells}")
 
+        # === METRICS START ===
+        metrics.add_yolo_grid()
+        metrics.add_segmentation()
+        
+
         return {
             'success': True,
             'target_object': target_object,
@@ -1435,7 +1448,7 @@ class UnifiedCaptchaProcessor:
                 if class_results and len(class_results.probs.data) > target_class_idx:
                     target_prob = float(class_results.probs.data[target_class_idx])
 
-                    # NOTE: Paper methodology vs implementation difference
+                    # NOTE: Paper methodology vs implementation difference -- Only if backend is YOLO alone 
                     # Paper used top-1 class prediction for both YOLO and VLM to enable fair benchmarking.
                     # This implementation uses top-3 for YOLO to provide better robustness in deployment
                     # by showing confidence across multiple predictions for debugging and analysis.
@@ -1480,6 +1493,12 @@ class UnifiedCaptchaProcessor:
         logger.always_log(f"   Cells selected: {len(selected_cells_indices)}")
         logger.always_log(f"   Selected cell indices: {selected_cells_indices}")
         logger.always_log(f"   Final captcha type: {final_captcha_type}")
+
+        # === METRICS START ===
+        metrics.add_yolo_cells(len(cell_images))
+        if is_dynamic:
+            metrics.add_dynamic()
+        metrics.add_classification()
 
         return {
             'success': True,
@@ -1678,61 +1697,35 @@ class UnifiedCaptchaProcessor:
 
     def _solve_classification_captcha_hybrid_cascade(self, frame, target_object, all_cells_data, using_global_coords=False):
         """
-        Per-cell confidence cascade for classification puzzles (deployment variant of paper Eq. 3).
+        Paper-faithful hybrid cascade per Eq. 3:
 
-        Routing per cell, keyed on YOLO's probability for the *target* class
-        (not max softmax) so cells containing multiple objects route correctly:
-          1. Target c not in YOLO classes        -> entire puzzle delegated to VLM solver.
-          2. target_prob >= HYBRID_TAU_SELECT    -> SELECT (trust YOLO).
-          3. target in top-K AND target_prob >= HYBRID_VLM_FLOOR
-                                                 -> VLM fallback (YES/NO prompt).
-          4. otherwise                           -> REJECT (YOLO doesn't rank target as plausible).
+            r(x,c) = f_VLM(x)   if c not in C_YOLO
+                     f_YOLO(x)  if c in C_YOLO and max(f_YOLO(x)) >= tau
+                     f_VLM(x)   if c in C_YOLO and max(f_YOLO(x)) <  tau
 
-        VLM uses the existing deployment YES/NO prompt rather than the paper's 0-15 index
-        prompt; functionally equivalent here since the target is already known.
+        A cell is selected iff the predicted class name == target name.
+        - YOLO predicts via argmax of the softmax distribution.
+        - VLM uses the 0-15 numbered-class prompt from paper Appendix H and
+          returns a class index that maps back to PAPER_CLASS_NAMES.
+        - For unsupported targets (Boat, Taxi, Tractor in this codebase),
+          every cell is sent to VLM with the same paper prompt.
         """
-        logger.always_log(f"=== HYBRID CASCADE CLASSIFICATION SOLVER STARTING ===")
+        logger.always_log(f"=== PAPER CASCADE CLASSIFICATION SOLVER STARTING ===")
         logger.always_log(f"   Target object: '{target_object}'")
         logger.always_log(f"   Number of cells: {len(all_cells_data)}")
-        logger.always_log(f"   Thresholds: SELECT>={self.HYBRID_TAU_SELECT}, VLM band=[{self.HYBRID_VLM_FLOOR},{self.HYBRID_TAU_SELECT}) AND in top-{self.HYBRID_TOP_K}")
+        logger.always_log(f"   Threshold: tau = {self.HYBRID_TAU_SELECT}")
 
         original_target = target_object
-        target_lower = target_object.lower().strip()
-
-        # Compound name remapping (matches _solve_classification_captcha)
-        name_mappings = {
-            'fire hydrant': 'hydrant', 'fire hydrants': 'hydrant',
-            'traffic light': 'traffic light', 'traffic lights': 'traffic light',
-            'palm tree': 'palm', 'palm trees': 'palm',
-        }
-        if target_lower in name_mappings:
-            target_object = name_mappings[target_lower]
+        target_canonical = self._canonical_class_name(target_object)
+        logger.always_log(f"   Target (canonical): '{target_canonical}'")
 
         yolo_model = self.yolo_classification_backend.model
-        target_class_idx = next(
-            (k for k, v in yolo_model.names.items() if v.lower() == target_object.lower()),
-            None
-        )
+        yolo_class_names_canonical = {
+            self._canonical_class_name(v) for v in yolo_model.names.values()
+        }
+        target_in_yolo = target_canonical in yolo_class_names_canonical
 
-        # Plural fallback (matches _solve_classification_captcha)
-        if target_class_idx is None and target_object.endswith('s') and target_object.lower() not in ['bus', 'class']:
-            singular = target_object[:-1]
-            test_idx = next(
-                (k for k, v in yolo_model.names.items() if v.lower() == singular.lower()),
-                None
-            )
-            if test_idx is not None:
-                target_object = singular
-                target_class_idx = test_idx
-
-        # Branch 1 of Eq. 3: target unsupported by YOLO -> route entire puzzle to VLM.
-        if target_class_idx is None:
-            logger.always_log(f"HYBRID CASCADE: '{original_target}' unsupported by YOLO -> routing all cells to VLM")
-            return self._solve_classification_captcha_llm_streaming(frame, original_target, all_cells_data)
-
-        logger.always_log(f"YOLO target class index: {target_class_idx} ('{yolo_model.names[target_class_idx]}')")
-
-        # Dynamic-puzzle detection mirrors _solve_classification_captcha so downstream FSM behavior matches.
+        # Dynamic-puzzle detection (FSM downstream uses this).
         ocr_results = self.ocr_reader.readtext(frame, detail=0, paragraph=True)
         full_text = " ".join(ocr_results).lower()
         dynamic_indicators = [
@@ -1743,7 +1736,7 @@ class UnifiedCaptchaProcessor:
         # 4x4 grids are always segmentation (never reach this method, but guard anyway)
         is_dynamic = has_dynamic_text if len(all_cells_data) != 16 else False
 
-        # Extract cell images and validate coordinates
+        # Extract cell images and validate coordinates.
         h, w = frame.shape[:2]
         cell_images = []
         valid_cells = []
@@ -1759,89 +1752,112 @@ class UnifiedCaptchaProcessor:
             cell_images.append(cell_image)
             valid_cells.append(cell)
 
-        if not cell_images:
+        if not valid_cells:
             return {
                 'success': False,
-                'error': 'No valid cells to classify in hybrid cascade',
+                'error': 'No valid cells to classify in cascade',
                 'retry_needed': True,
-                'coordinates_are_global': using_global_coords
+                'coordinates_are_global': using_global_coords,
             }
-
-        logger.always_log(f"Running batch YOLO classification on {len(cell_images)} cells...")
-        batch_results = yolo_model(cell_images, verbose=False, conf=0.20)
 
         selected_cells_indices = []
         yolo_handled = 0
         vlm_handled = 0
 
-        for cell, class_results in zip(valid_cells, batch_results):
-            cell_idx = cell['cell_index']
-            x1, y1, x2, y2 = cell['coords']
-
-            # YOLO produced no usable result -> VLM fallback
-            if (not class_results or class_results.probs is None
-                    or class_results.probs.data is None):
+        if not target_in_yolo:
+            # Branch 1: target unsupported by YOLO -> every cell to VLM.
+            logger.always_log(
+                f"PAPER CASCADE: '{original_target}' (canonical='{target_canonical}') unsupported by YOLO "
+                f"-> routing all {len(valid_cells)} cells to VLM"
+            )
+            for cell in valid_cells:
+                cell_idx = cell['cell_index']
+                x1, y1, x2, y2 = cell['coords']
+                vlm_result = self._vlm_classify_paper_prompt(frame[y1:y2, x1:x2])
                 vlm_handled += 1
-                logger.always_log(f"   Cell {cell_idx}: YOLO returned no probs -> VLM fallback")
-                vlm_result = self._run_llm_analysis_single_cell_data(frame[y1:y2, x1:x2], original_target)
-                if vlm_result.get('success') and vlm_result.get('has_object'):
+                pred = vlm_result.get('class_name')
+                raw = (vlm_result.get('raw') or '')[:30]
+                if vlm_result.get('success') and pred == target_canonical:
+                    logger.always_log(f"   Cell {cell_idx}: VLM SELECTED (predicted='{pred}'=target, raw='{raw}')")
                     selected_cells_indices.append(cell_idx)
-                continue
+                else:
+                    logger.always_log(f"   Cell {cell_idx}: VLM REJECTED (predicted='{pred}', raw='{raw}')")
+        else:
+            # Branches 2 and 3: YOLO batch, then per-cell route based on max(softmax).
+            logger.always_log(f"Running batch YOLO classification on {len(cell_images)} cells...")
+            batch_results = yolo_model(cell_images, verbose=False, conf=0.20)
 
-            probs = class_results.probs.data.cpu().numpy()
-            target_prob = float(probs[target_class_idx])
-            topk_indices = probs.argsort()[-self.HYBRID_TOP_K:][::-1]
-            target_in_topk = target_class_idx in topk_indices
-            argmax_idx = int(topk_indices[0])
-            argmax_class = yolo_model.names[argmax_idx]
+            for cell, class_results in zip(valid_cells, batch_results):
+                cell_idx = cell['cell_index']
+                x1, y1, x2, y2 = cell['coords']
 
-            if target_prob >= self.HYBRID_TAU_SELECT:
-                # Branch 2: YOLO is confident the target IS in this cell -> trust YOLO.
-                yolo_handled += 1
-                logger.always_log(
-                    f"   Cell {cell_idx}: YOLO SELECTED "
-                    f"(target_prob={target_prob:.3f} >= {self.HYBRID_TAU_SELECT}, argmax={argmax_class})"
-                )
-                selected_cells_indices.append(cell_idx)
-            elif target_in_topk and target_prob >= self.HYBRID_VLM_FLOOR:
-                # Branch 3: target plausible but not decisive -> VLM fallback.
-                vlm_handled += 1
-                logger.always_log(
-                    f"   Cell {cell_idx}: YOLO uncertain "
-                    f"(target_prob={target_prob:.3f} in [{self.HYBRID_VLM_FLOOR},{self.HYBRID_TAU_SELECT}), "
-                    f"target in top-{self.HYBRID_TOP_K}, argmax={argmax_class}) -> VLM fallback"
-                )
-                vlm_result = self._run_llm_analysis_single_cell_data(frame[y1:y2, x1:x2], original_target)
-                if vlm_result.get('success'):
-                    response_preview = (vlm_result.get('response') or '')[:30]
-                    if vlm_result.get('has_object'):
-                        logger.always_log(f"   Cell {cell_idx}: VLM SELECTED (response='{response_preview}')")
+                # YOLO produced no usable result -> treat as max=0, escalate to VLM.
+                if (not class_results or class_results.probs is None
+                        or class_results.probs.data is None):
+                    vlm_handled += 1
+                    logger.always_log(f"   Cell {cell_idx}: YOLO returned no probs -> VLM fallback")
+                    vlm_result = self._vlm_classify_paper_prompt(frame[y1:y2, x1:x2])
+                    pred = vlm_result.get('class_name')
+                    raw = (vlm_result.get('raw') or '')[:30]
+                    if vlm_result.get('success') and pred == target_canonical:
+                        logger.always_log(f"   Cell {cell_idx}: VLM SELECTED (predicted='{pred}'=target, raw='{raw}')")
                         selected_cells_indices.append(cell_idx)
                     else:
-                        logger.always_log(f"   Cell {cell_idx}: VLM REJECTED (response='{response_preview}')")
+                        logger.always_log(f"   Cell {cell_idx}: VLM REJECTED (predicted='{pred}', raw='{raw}')")
+                    continue
+
+                probs = class_results.probs.data.cpu().numpy()
+                max_prob = float(probs.max())
+                argmax_idx = int(probs.argmax())
+                argmax_class = self._canonical_class_name(yolo_model.names[argmax_idx])
+
+                if max_prob >= self.HYBRID_TAU_SELECT:
+                    # Branch 2: trust YOLO -> select iff argmax == target, else reject.
+                    yolo_handled += 1
+                    if argmax_class == target_canonical:
+                        logger.always_log(
+                            f"   Cell {cell_idx}: YOLO SELECTED "
+                            f"(max={max_prob:.3f} >= tau, argmax='{argmax_class}'=target)"
+                        )
+                        selected_cells_indices.append(cell_idx)
+                    else:
+                        logger.always_log(
+                            f"   Cell {cell_idx}: YOLO REJECTED "
+                            f"(max={max_prob:.3f} >= tau, argmax='{argmax_class}'!=target)"
+                        )
                 else:
-                    logger.always_log(f"   Cell {cell_idx}: VLM ERROR: {vlm_result.get('error', 'unknown')}")
-            else:
-                # Branch 4: YOLO doesn't rank target as plausible -> REJECT without VLM call.
-                yolo_handled += 1
-                if not target_in_topk:
-                    reason = f"target not in top-{self.HYBRID_TOP_K}"
-                else:
-                    reason = f"target_prob={target_prob:.3f} < {self.HYBRID_VLM_FLOOR}"
-                logger.always_log(
-                    f"   Cell {cell_idx}: YOLO REJECTED ({reason}, argmax={argmax_class})"
-                )
+                    # Branch 3: max < tau -> VLM fallback with paper prompt.
+                    vlm_handled += 1
+                    logger.always_log(
+                        f"   Cell {cell_idx}: YOLO uncertain "
+                        f"(max={max_prob:.3f} < tau, argmax='{argmax_class}') -> VLM"
+                    )
+                    vlm_result = self._vlm_classify_paper_prompt(frame[y1:y2, x1:x2])
+                    pred = vlm_result.get('class_name')
+                    raw = (vlm_result.get('raw') or '')[:30]
+                    if vlm_result.get('success') and pred == target_canonical:
+                        logger.always_log(f"   Cell {cell_idx}: VLM SELECTED (predicted='{pred}'=target, raw='{raw}')")
+                        selected_cells_indices.append(cell_idx)
+                    else:
+                        logger.always_log(f"   Cell {cell_idx}: VLM REJECTED (predicted='{pred}', raw='{raw}')")
 
         total_handled = yolo_handled + vlm_handled
         vlm_rate = (vlm_handled / total_handled * 100) if total_handled > 0 else 0.0
         final_captcha_type = 'dynamic_classification' if is_dynamic else 'classification'
 
-        logger.always_log(f"=== HYBRID CASCADE COMPLETE ===")
+        logger.always_log(f"=== PAPER CASCADE COMPLETE ===")
         logger.always_log(f"   YOLO-handled cells: {yolo_handled}/{total_handled}")
         logger.always_log(f"   VLM-handled cells:  {vlm_handled}/{total_handled} ({vlm_rate:.1f}%)")
         logger.always_log(f"   Total selected:     {len(selected_cells_indices)}")
         logger.always_log(f"   Selected indices:   {selected_cells_indices}")
         logger.always_log(f"   Final captcha type: {final_captcha_type}")
+
+        # === METRICS START ===
+        metrics.add_yolo_cells(yolo_handled)
+        metrics.add_vlm_cells(vlm_handled)
+        if is_dynamic:
+            metrics.add_dynamic()
+        metrics.add_classification()
 
         return {
             'success': True,
@@ -1849,80 +1865,151 @@ class UnifiedCaptchaProcessor:
             'selected_cells': selected_cells_indices,
             'all_cells_data': all_cells_data,
             'captcha_type': final_captcha_type,
-            'coordinates_are_global': using_global_coords
+            'coordinates_are_global': using_global_coords,
         }
+
+    def _canonical_class_name(self, name):
+        """
+        Map any class string (OCR target, YOLO model class, paper-prompt class)
+        to a canonical lowercase form matching one of PAPER_CLASS_NAMES.
+        Returns the input lowercased+stripped if no canonical match is found.
+        """
+        if not name:
+            return ''
+        n = name.lower().strip()
+
+        compound_mappings = {
+            'fire hydrant': 'hydrant', 'fire hydrants': 'hydrant',
+            'traffic lights': 'traffic light',
+            'palm tree': 'palm', 'palm trees': 'palm',
+        }
+        if n in compound_mappings:
+            return compound_mappings[n]
+
+        canonical_set = {c.lower() for c in self.PAPER_CLASS_NAMES}
+        if n in canonical_set:
+            return n
+
+        # Plural removal: 'crosswalks' -> 'crosswalk'. Skip names that are already
+        # singular but happen to end in 's' (bus, stairs).
+        if n.endswith('s') and n not in canonical_set:
+            singular = n[:-1]
+            if singular in canonical_set:
+                return singular
+
+        return n  # unrecognized; return as-is so comparisons still work
+
+    def _vlm_classify_paper_prompt(self, cell_image_cv):
+        """
+        Send a single cell to VLM with the paper Appendix H 0-15 numbered-class
+        prompt. Parse the response as a class index and map back to a canonical
+        lowercase class name.
+
+        Returns dict:
+            'success'    : bool
+            'class_name' : canonical lowercase name (one of PAPER_CLASS_NAMES) or None
+            'raw'        : raw model output (for logging)
+        """
+        from PIL import Image
+        import requests
+        import io
+        import re
+
+        prompt = (
+            "Choose ONLY ONE number from the following list:\n"
+            "0: Bicycle, 1: Bridge, 2: Bus, 3: Car, 4: Chimney,\n"
+            "5: Crosswalk, 6: Hydrant, 7: Motorcycle, 8: Mountain,\n"
+            "9: Other, 10: Palm, 11: Stairs, 12: Traffic Light,\n"
+            "13: Boat, 14: Taxi, 15: Tractor\n"
+            "Answer with ONLY the number (0-15) of the class\n"
+            "you see with the highest confidence.\n"
+            "Do not include any explanation."
+        )
+
+        try:
+            cell_image_rgb = cv2.cvtColor(cell_image_cv, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(cell_image_rgb)
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "placeholder"},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            files = {'image': ('image.png', img_byte_arr, 'image/png')}
+            data = {'messages_json': json.dumps(messages)}
+
+            response = requests.post(f"{self.api_url}/generate", files=files, data=data, timeout=30)
+            if response.status_code != 200:
+                return {'success': False, 'class_name': None, 'raw': f'HTTP {response.status_code}'}
+
+            model_output = (response.json().get('model_output') or '').strip()
+
+            # Match the first integer 0-15 in the response (handles "5", "5.",
+            # "5: Crosswalk", "Answer: 5", etc.).
+            match = re.search(r'\b(1[0-5]|[0-9])\b', model_output)
+            if not match:
+                return {'success': False, 'class_name': None, 'raw': model_output}
+
+            idx = int(match.group(1))
+            if 0 <= idx < len(self.PAPER_CLASS_NAMES):
+                return {
+                    'success': True,
+                    'class_name': self.PAPER_CLASS_NAMES[idx].lower(),
+                    'raw': model_output,
+                }
+            return {'success': False, 'class_name': None, 'raw': model_output}
+        except Exception as e:
+            return {'success': False, 'class_name': None, 'raw': f'Exception: {e}'}
 
 
     def _solve_classification_captcha_llm_streaming(self, frame, target_object, all_cells_data):
-        """Solve classification CAPTCHA using sequential LLM analysis"""
-        logger.log(f"Using LLM sequential classification for CAPTCHA: {target_object}")
-        logger.log(f"   Sequential processing: Analyze each cell, collect results")
+        """Solve classification CAPTCHA using sequential VLM analysis with the
+        paper Appendix H 0-15 numbered-class prompt (paper-faithful)."""
+        logger.log(f"Using VLM sequential classification (paper prompt) for CAPTCHA: {target_object}")
 
-        # Detect if this is a dynamic captcha
+        target_canonical = self._canonical_class_name(target_object)
         is_dynamic = self._detect_dynamic_captcha(frame)
 
         total_cells = len(all_cells_data)
-        all_responses = {}  # Store all LLM responses for debugging
         selected_cells = []
         start_time = time.time()
-        
-        # Process cells sequentially for immediate clicking
-        logger.log(f"Processing {total_cells} cells sequentially for immediate action")
-        
-        for i, cell_data in enumerate(all_cells_data):
+
+        for cell_data in all_cells_data:
             cell_index = cell_data['cell_index']
-            
             try:
-                # Extract cell image
                 x1, y1, x2, y2 = cell_data['coords']
                 cell_image = frame[y1:y2, x1:x2]
 
-                # Run LLM analysis on single cell
                 api_start = time.time()
-                result = self._run_llm_analysis_single_cell_data(cell_image, target_object)
+                result = self._vlm_classify_paper_prompt(cell_image)
                 api_time = time.time() - api_start
-                
-                if result['success']:
-                    has_object = result['has_object']
-                    response_text = result.get('response', 'Unknown')
-                    
-                    # Store response for debugging
-                    all_responses[cell_index] = {
-                        'success': True,
-                        'has_object': has_object,
-                        'response': response_text,
-                        'api_time': api_time
-                    }
-                    
-                    if has_object:
-                        logger.log(f"Cell {cell_index}: YES - {target_object} detected (API: {api_time:.2f}s)")
-                        selected_cells.append(cell_index)
-                    else:
-                        logger.log(f"Cell {cell_index}: NO - skipping (API: {api_time:.2f}s)")
+
+                pred = result.get('class_name')
+                raw = (result.get('raw') or '')[:30]
+
+                if result.get('success') and pred == target_canonical:
+                    logger.log(f"Cell {cell_index}: VLM SELECTED predicted='{pred}'=target raw='{raw}' (API: {api_time:.2f}s)")
+                    selected_cells.append(cell_index)
                 else:
-                    error_msg = result.get('error', 'Unknown error')
-                    logger.log(f"Cell {cell_index}: API failed - {error_msg}")
-                    all_responses[cell_index] = {
-                        'success': False,
-                        'error': error_msg
-                    }
-                    
-                # Log progress
-                elapsed = time.time() - start_time
-                progress = (i + 1) / total_cells * 100
-                logger.log(f"Progress: {i+1}/{total_cells} cells ({progress:.0f}%) in {elapsed:.1f}s")
-                
+                    logger.log(f"Cell {cell_index}: VLM REJECTED predicted='{pred}' raw='{raw}' (API: {api_time:.2f}s)")
             except Exception as e:
-                logger.log(f"Cell {cell_index}: Exception - {str(e)}")
-                all_responses[cell_index] = {
-                    'success': False,
-                    'error': str(e)
-                }
+                logger.log(f"Cell {cell_index}: Exception - {e}")
 
         elapsed = time.time() - start_time
-
-        # Determine final captcha type based on dynamic detection
         final_captcha_type = 'dynamic_classification' if is_dynamic else 'classification'
+
+        # === METRICS START ===
+        metrics.add_vlm_cells(total_cells)
+        if is_dynamic:
+            metrics.add_dynamic()
+        metrics.add_classification()
 
         return {
             'success': True,
@@ -1931,94 +2018,14 @@ class UnifiedCaptchaProcessor:
             'all_cells_data': all_cells_data,
             'captcha_type': final_captcha_type,
             'sequential': True,
-            'total_time': elapsed
+            'total_time': elapsed,
         }
 
-    # NOTE: Paper methodology vs implementation difference
-    # Paper used class index prompts (0-15) for VLM to enable fair benchmarking against YOLO.
-    # This implementation uses YES/NO binary prompts for practical deployment because:
-    # 1) Clearer binary decision making for cell classification
-    # 2) Simpler prompt engineering for reliable responses
-    # 3) Better suited for training data generation (LLM as teacher)
-    def _run_llm_analysis_single_cell_data(self, cell_image_cv, object_name):
-        """Run LLM analysis on a single cell image data for YES/NO classification (no temp files)"""
-        try:
-            from PIL import Image
-            import requests
-            import io
-
-            # Convert OpenCV image (BGR) to PIL Image (RGB)
-            cell_image_rgb = cv2.cvtColor(cell_image_cv, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(cell_image_rgb)
-
-            # Create classification prompt
-            prompt = f"""Look at this image carefully.
-
-Question: Does this image contain {object_name}?
-
-Please answer with YES or NO only.
-
-If you see any type of {object_name}, answer YES.
-If you see anything else that is NOT {object_name}, answer NO.
-
-Answer: """
-
-            # Prepare image for API
-            img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
-
-            # Create proper message format for backend
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": "placeholder"},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
-
-            # Make API request with correct format
-            files = {'image': ('image.png', img_byte_arr, 'image/png')}
-            data = {'messages_json': json.dumps(messages)}
-
-            response = requests.post(f"{self.api_url}/generate", files=files, data=data, timeout=30)
-
-            if response.status_code == 200:
-                result = response.json()
-                model_output = result.get('model_output', '').strip().upper()
-
-                # Parse YES/NO response
-                has_object = 'YES' in model_output and 'NO' not in model_output
-
-                return {
-                    'success': True,
-                    'has_object': has_object,
-                    'response': model_output
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': f'API request failed: {response.status_code}'
-                }
-
-        except Exception as e:
-            return {
-                'success': False,
-                'error': f'Single cell analysis failed: {str(e)}'
-            }
-
-    def _run_llm_analysis(self, image_path, object_name, mode="classification", max_retries=2):
-        """Run LLM analysis using VisionLLMClient with retry mechanism"""
+    def _run_llm_analysis(self, image_path, object_name, max_retries=2):
+        """Run VLM bounding-box detection on a concatenated grid image with retry."""
         for attempt in range(max_retries + 1):
             try:
-                if mode == "classification":
-                    # For classification: analyze folder for individual cells
-                    result = self.analyzer.classify_objects_in_folder(image_path, object_name)
-                else:  # detection/segmentation mode
-                    # For segmentation: analyze single image for bounding boxes
-                    result = self.analyzer.detect_objects_with_boxes(image_path, object_name)
+                result = self.analyzer.detect_objects_with_boxes(image_path, object_name)
 
                 if result and result.get('success'):
                     return {'success': True, 'result': result, 'output_dir': os.getcwd()}
@@ -2074,7 +2081,7 @@ Answer: """
 
         try:
             # Run LLM detection on concatenated image
-            result = self._run_llm_analysis(concatenated_path, target_object, mode="detection")
+            result = self._run_llm_analysis(concatenated_path, target_object)
 
             if result['success']:
                 # Parse detection results and map to grid cells
@@ -2082,6 +2089,11 @@ Answer: """
                 grid_size = 3 if len(all_cells_data) == 9 else 4
                 detection_data = result.get('result', {}).get('summary', {})
                 selected_cells = self._parse_detection_data(detection_data, concatenated_path, grid_size=grid_size)
+
+                # === METRICS START ===
+                metrics.add_vlm_grid()
+                metrics.add_segmentation()
+                # === METRICS END ===
 
                 return {
                     'success': True,

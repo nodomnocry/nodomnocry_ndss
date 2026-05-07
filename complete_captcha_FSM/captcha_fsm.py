@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 from logger import logger
 from config import config
+from metrics import metrics
+
 class CaptchaState(Enum):
     IDLE = "idle"
     CHECKBOX_CLICKED = "checkbox_clicked"
@@ -117,6 +119,9 @@ class CaptchaStateMachine:
         # Clear previous cell data (coordinates + hashes)
         if hasattr(self, 'previous_cell_data'):
             self.previous_cell_data = {}
+
+        # === METRICS START ===
+        metrics.add_new_puzzle()
 
     def run(self):
         iteration = 0
@@ -615,6 +620,8 @@ class CaptchaStateMachine:
         verification_result = self._check_verification_result()
 
         if verification_result == "success":
+            
+            metrics.add_success()
             self.transition_to(CaptchaState.PUZZLE_COMPLETED, "CAPTCHA completed successfully")
         elif verification_result == "failed":
             logger.always_log("=" * 70)
@@ -1051,6 +1058,9 @@ class CaptchaStateMachine:
 
     def _handle_puzzle_reloading(self):
         from captcha_solver_bridge import find_and_click_reload_button
+        # === METRICS START ===
+        metrics.add_reload()
+        # === METRICS END ===
         self.reload_count += 1
 
         # Prevent infinite reloading - if we tried too many times, just give up

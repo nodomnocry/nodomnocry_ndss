@@ -170,7 +170,8 @@ Where (x1, y1) is top-left corner and (x2, y2) is bottom-right corner."""
 
         return objects
 
-
+    # Teacher-student pipeline for efficiency
+    # TBD
     def classify_objects_in_folder(self, folder_path: str, object_name: str) -> Dict:
         """
         Classify objects in individual images with YES/NO responses.
