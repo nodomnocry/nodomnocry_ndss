@@ -1,14 +1,22 @@
 # No DOM, No Cry: Human-Inspired CAPTCHA Solving via YOLO Reflexes and VLM Teachers
 
+Vision-language model (VLM) agents can now operate computers on behalf of users, and recent work shows they can solve visual CAPTCHAs without task-specific training. What they lack is the ability to learn from experience. Humans, by contrast, leverage prior experience naturally. The first CAPTCHA requires deliberate effort to read the instructions, examine the grid, and reason about each tile, but after a few encounters the entire process collapses into reflex. VLM agents never make this transition. Every CAPTCHA is treated as a novel reasoning problem, even after hundreds of encounters with visually identical challenges at significant latency and cost (e.g., 21.8 s and $2.40 per 100 puzzles). Fast specialized classifiers avoid this cost but fail entirely on unseen categories, and neither approach improves over time with exposure.
 
-  Traditional CAPTCHA solvers require Document Object Model (DOM) access to detect UI elements, making them incompatible with fully visual GUI agents. While Vision-Language Models (VLMs) offer superior reasoning, they are too expensive and slow for real-time CAPTCHA solutions. We introduce a DOM-free hybrid architecture inspired by how humans develop reflexes for familiar patterns to avoid the latency of decision process. In this architecture, YOLO model handles frequent and routine tasks like human reflexes while VLM reasoning intervenes only for novel or hard problems like a slow cognitive process. Our system utilizes a fine-tuned YOLOv8 backbone for real-time UI localization, dynamically routing challenges either to specialized YOLO classifiers for rapid pattern recognition or to an open-weight Qwen-7B VLM for semantic reasoning on novel or hard-to-distinguish categories. Combining these complementary strengths, our hybrid method achieves 86.85% macro-averaged recall, +24.2% over YOLO-only baselines. This macro-averaged performance is critical as CAPTCHA designers can prioritize the distributions of classes where known YOLO-only solvers fail. Beyond current performance gains, this work establishes a paradigm shift in efficient automation where VLM acts as a "teacher" to programmatically label novel challenges encountered during operation. We propose that as the agent accumulates sufficient samples for new categories, it can autonomously train and deploy specialized YOLO-based solvers as reflexes. Until such data is sufficient, VLM continues to intervene to provide accurate solutions. This approach allows future AI agents to achieve maximum efficiency by distilling expensive visual reasoning into millisecond-scale reflexes, using VLM for the discovery of novel patterns while specialized classifiers execute rapid responses required for CAPTCHA solution.
+This paper is not about building yet another CAPTCHA solver — it is about what CAPTCHA solving looks like in the agentic era, where solvers can reason, learn, and adapt. We present a DOM-free hybrid architecture that mirrors human dual-process cognition: a fine-tuned YOLOv8 provides fast reflexes from screenshots while an open-weight Qwen-7B VLM supplies deliberate reasoning, with a confidence-based cascade dispatching 70% of challenges at reflex speed (4 ms) and invoking VLM (225 ms) only when needed. The hybrid achieves 85.4% overall and 84.2% macro accuracy across 16 classes (+10.0 percentage points and +24.2 percentage points over a YOLO-only baseline). By design, every challenge the VLM solves becomes a labeled training example for YOLO, enabling the system to autonomously expand its capabilities with each encounter. We demonstrate that previously unsupported object classes can be learned from only a few VLM-labeled puzzle encounters, and that PGD adversarial attacks reducing YOLO to 0% accuracy are autonomously recovered through VLM-guided retraining. Counterintuitively, under iterative grey-box escalation, VLM's imperfect labels cause the solver to diverge from the defender's surrogate, yielding a 53 percentage point robustness advantage that clean labels cannot achieve — a property typically seen as a limitation becomes an implicit defense. These results challenge a core assumption of visual CAPTCHA defenses: that bot failures remain persistent. When a solver reasons, adapts, and hardens with each encounter, temporary failures become permanent reflexes, undermining the security model that visual CAPTCHAs depend on.
 
 
 ## Key Strengths
 
 **State-of-the-Art Performance**
 - Handles all three reCAPTCHA v2 puzzle types with rare class support (classification, segmentation, dynamic)
-- 86.85% macro-averaged recall (+24.2% over YOLO-only baselines)
+- 85.4% overall accuracy (+10.0pp over YOLO-only baseline)
+- 84.2% macro-averaged accuracy (+24.2pp over YOLO-only baseline)
+- VLM invoked for only 30% of images via confidence-based cascade routing
+
+**Adaptive Learning**
+- Teacher-student distillation: VLM labels unsupported classes, YOLO learns them as reflexes
+- Taxi: 96% recall from ~2 puzzle encounters, Tractor: 88% from ~3 puzzles
+- Autonomous recovery from adversarial attacks via VLM-guided retraining
 
 **Cross-Platform Compatible**
 - Works on Linux, macOS and Windows
@@ -17,7 +25,7 @@
 **Cross-Browser Compatible**
 - **Works with ANY browser** (Chrome, Firefox, Edge, Safari, etc.)
 - **No DOM access required** - Screenshot-based interaction
-- **No browser automation frameworks** No automation framework or browser needed (Selenium, Playwright, Puppeteer)
+- **No browser automation frameworks** - No Selenium, Playwright, or Puppeteer needed
 - **Evades WebDriver detection** - No DOM manipulation signatures
 
 **Open-Weight Models**
@@ -28,6 +36,7 @@
 ## System Requirements
 
 ### Hardware Requirements
+- **Minimum**: 16GB RAM, 20GB disk space. YOLO-only solver can run on CPU without GPU, though inference will be significantly slower
 - **Recommended (Hybrid mode)**: 32GB RAM, 16GB+ GPU VRAM (NVIDIA RTX 3090 or equivalent), 100GB disk space
 
 ### Software Requirements
@@ -36,6 +45,7 @@
 - **Browsers**: Any modern browser with screenshot capability
 - **Key Libraries**: PyTorch, Transformers, Ultralytics (YOLOv8), PyAutoGUI, MSS, OpenCV
 - **Display Resolution**: The system performs optimally at 1920x1080 resolution. For other display resolutions, browser zoom adjustment may be necessary to ensure reliable UI element localization
+
 ### Platform-Specific Requirements
 
 **Linux**:
@@ -71,26 +81,26 @@ pip install -r requirements.txt
 ```
 
 4. Required model files:
-   - `detection_model.pt` (39 MB) - Detection model
+   - `detection_model.pt` (39 MB) - UI element detection model
    - `classification_model.pt` (2.9 MB) - Classification model
-   - `yolov8x-seg.pt` (140 MB) - Segmentation model (auto-download due to size limitation)
+   - `yolov8x-seg.pt` (140 MB) - Segmentation model (auto-download on first run)
 
 ### Command-line Arguments
 
 - `-v, --verbose`: Enable verbose output for debugging
 - `--no-mouse`: Disable mouse movement animations
 - `--backend {yolo,llm,hybrid}`: Choose the solver backend
-- `yolo`: Full YOLO-based detection and classification (default)
-- `llm`: YOLO detection with LLM-based classification
-- `hybrid`: Best backend per object type
+  - `yolo`: Full YOLO-based detection and classification (default, fastest)
+  - `llm`: YOLO UI detection with VLM-based classification (requires VLM backend)
+  - `hybrid`: Confidence-based routing between YOLO and VLM (requires VLM backend)
 
 ### Examples
 
 ```bash
-# Run with YOLO only backend
+# Run with YOLO only backend (default)
 python main.py
 
-# Run with LLM only backend
+# Run with VLM backend
 python main.py --backend llm
 
 # Run with hybrid mode
@@ -99,7 +109,7 @@ python main.py --backend hybrid
 
 ## Configuration
 
-- `config.json`: Contains the API URL for LLM backend communication (if using LLM/hybrid modes)
+- `config.json`: Contains the API URL for VLM backend communication (if using llm/hybrid modes)
 - `config.py`: Global configuration for mouse movement behavior
 
 ## Architecture Overview
@@ -112,28 +122,40 @@ This hybrid architecture achieves superior performance by combining:
 1. Fine-tuned YOLOv8 for real-time UI element detection
 2. Specialized YOLO classifiers for common object classes
 3. Open-weight Qwen-7B-VL for zero-shot reasoning on rare categories
-4. Finite-state machine controller for robust puzzle solving
+4. Confidence-based cascade routing (threshold = 0.70)
+5. Finite-state machine controller for robust puzzle solving
 
 ## Project Structure
 
 ```
 .
-├── main.py                          # Main entry point
-├── captcha_fsm.py                   # State machine for CAPTCHA solving
-├── unified_captcha_processor.py     # Core processor with multiple backends
-├── captcha_solver_bridge.py         # Interface bridge
-├── universal_object_analyzer.py     # LLM analysis utility
-├── logger.py                        # Logging utility
-├── config.py                        # Global configuration
-├── config.json                      # API configuration
-├── requirements.txt                 # Python dependencies
-├── detection_model.pt               # Detection model checkpoint
-├── classification_model.pt          # Classification model
-├── yolov8x-seg.pt                   # Segmentation model (auto-download model if missing)
-├── captcha_detector_trainer/        # Detection dataset generation
-├── complete_classification/         # Classification experiments
-├── segmentation_metrics/            # Segmentation experiments (auto-download models if missing)
-└── llm_backend/                     # VLM server backend
+├── complete_captcha_FSM/                # CAPTCHA solver application
+│   ├── main.py                          # Main entry point
+│   ├── captcha_fsm.py                   # State machine for CAPTCHA solving
+│   ├── unified_captcha_processor.py     # Core processor with multiple backends
+│   ├── config.py                        # Global configuration
+│   ├── metrics.py                       # Live CAPTCHA solution metrics
+│   ├── config.json                      # API configuration
+│   ├── detection_model.pt               # UI element detection model
+│   ├── classification_model.pt          # Classification model
+│   └── yolov8x-seg.pt                   # Segmentation model (auto-download)
+├── experiments/                         # Evaluation and experiment notebooks
+│   ├── classification_metrics/          # Classification evaluation
+│   │   ├── classification_metrics.ipynb # Per-class metrics and confusion matrices
+│   │   └── cascade_routing_analysis.ipynb # Cascade threshold analysis
+│   ├── segmentation_metrics/            # Segmentation evaluation
+│   ├── distillation/                    # Experience Replay fine-tuning
+│   │   ├── taxi_finetune_er.ipynb
+│   │   ├── tractor_finetune_er.ipynb
+│   │   └── boat_finetune_er.ipynb
+│   └── adversarial/                     # Adversarial robustness experiments
+│       ├── 01_generate_pgd_attacks.ipynb
+│       ├── 02_vlm_inference_on_adversarial.ipynb
+│       ├── 03_sample_efficiency.ipynb
+│       └── 04_greybox_escalation.ipynb
+├── llm_backend/                         # VLM server backend
+├── captcha_detector_trainer/            # UI detection dataset generation
+└── requirements.txt                     # Python dependencies
 ```
 
 ## How It Works
@@ -141,9 +163,22 @@ This hybrid architecture achieves superior performance by combining:
 1. **Detection**: Continuously monitors the screen for reCAPTCHA checkboxes using YOLOv8
 2. **UI Localization**: Detects CAPTCHA area, grid cells, verify/reload buttons via screenshot analysis
 3. **Puzzle Analysis**: OCR extracts target object; determines puzzle type (classification vs segmentation)
-4. **Solving**: Routes to YOLO (fast) or VLM (accurate on rare classes) based on target object
+4. **Routing**: For unsupported classes, routes directly to VLM. For supported classes, YOLO classifies first; if confidence < 0.70, falls back to VLM
 5. **Verification**: Checks success and handles dynamic puzzles (tiles refresh after clicks)
 
+## Experiments
+
+### Teacher-Student Distillation
+VLM predictions serve as labeled training data to fine-tune YOLO on unsupported classes via Experience Replay. Results (10 seeds per N value):
+- **Taxi**: 96% recall at N=10 (~2 puzzle encounters)
+- **Tractor**: 88% recall at N=15 (~3 puzzle encounters)
+- **Boat**: 48% recall at N=6 (~1 puzzle encounter)
+
+### Adversarial Robustness
+PGD attacks (epsilon=4/255, 10 steps) reduce YOLO accuracy from 83.1% to 0%, but VLM accuracy drops only 3.7pp (78.7% to 75.0%). The solver autonomously recovers by retraining on VLM-labeled adversarial samples, reaching 65% adversarial accuracy from ~2,000 samples.
+
+### Grey-Box Escalation
+Over 6 rounds of iterative attacks, VLM label noise causes the solver to diverge from the defender's surrogate model, yielding a 53pp robustness advantage. The noisy labels function as an implicit defense against grey-box attacks.
 
 ## Ethical Considerations
 
